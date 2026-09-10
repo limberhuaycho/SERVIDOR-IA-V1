@@ -1,0 +1,12 @@
+{
+  "name": "@workspace/lc-systems",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --config vite.config.js --host 0.0.0.0",
+    "build": "vite build --config vite.config.js",
+    "serve": "vite preview --config vite.config.js --host 0.0.0.0"
+  },
+  "devDependencies": { "vite": "catalog:" }
+}
