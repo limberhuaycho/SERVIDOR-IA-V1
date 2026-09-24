@@ -761,7 +761,7 @@ function ImageAIGeneratorView() {
           className={`btn ${tab === 'cat-lab' ? 'btn-primary' : 'btn-secondary'}`}
           onClick={() => setTab('cat-lab')}
         >
-          <Cat size={15} /> Red Neuronal de Gatos (Entrenamiento + IA)
+          <Cat size={15} /> Red Neuronal (Entrenamiento + IA)
         </button>
         <button
           className={`btn ${tab === 'generate' ? 'btn-primary' : 'btn-secondary'}`}
@@ -774,14 +774,14 @@ function ImageAIGeneratorView() {
       {tab === 'cat-lab' ? (
         <div className="tool-layout">
           <section className="panel">
-            <h2>🐱 Laboratorio Felino con Red Neuronal</h2>
+            <h2>Laboratorio con Red Neuronal</h2>
             <p className="panel-sub">
               Sube una foto de entrada de tu gato, indica su nombre y descripción. La red neuronal entrenada desde cero extraerá los rasgos, optimizará los pesos y guiará a OpenAI para generar la obra final.
             </p>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               <div>
-                <label className="input-label">Foto de entrada del gato (Opcional pero recomendada)</label>
+                <label className="input-label">Foto de entrada (Opcional pero recomendada)</label>
                 <div
                   className="dropzone"
                   style={{ minHeight: 140, padding: 15 }}
@@ -812,7 +812,7 @@ function ImageAIGeneratorView() {
               </div>
 
               <div>
-                <label className="input-label">Nombre del gato</label>
+                <label className="input-label">Nombre </label>
                 <input
                   className="input"
                   value={catName}
@@ -822,7 +822,7 @@ function ImageAIGeneratorView() {
               </div>
 
               <div>
-                <label className="input-label">Descripción o rasgos deseados</label>
+                <label className="input-label">Descripción</label>
                 <textarea
                   className="input"
                   rows={3}
