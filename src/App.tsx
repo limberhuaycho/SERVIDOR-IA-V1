@@ -753,7 +753,7 @@ function ImageAIGeneratorView() {
       <div className="eyebrow">Inteligencia Artificial / Creación y Redes</div>
       <h1 className="page-title">Generador de Imágenes & Red Neuronal</h1>
       <p className="page-lead">
-        Genera imágenes con OpenAI o utiliza el <strong>Laboratorio Felino</strong> con una red neuronal entrenada desde cero.
+        Genera imágenes con OpenAI o utiliza el <strong>Laboratorio</strong> con una red neuronal entrenada desde cero.
       </p>
 
       <div style={{ display: 'flex', gap: 10, marginBottom: 20 }}>
@@ -776,7 +776,7 @@ function ImageAIGeneratorView() {
           <section className="panel">
             <h2>Laboratorio con Red Neuronal</h2>
             <p className="panel-sub">
-              Sube una foto de entrada de tu gato, indica su nombre y descripción. La red neuronal entrenada desde cero extraerá los rasgos, optimizará los pesos y guiará a OpenAI para generar la obra final.
+              Sube una foto de entrada de una foto, indica su nombre y descripción. La red neuronal entrenada desde cero extraerá los rasgos, optimizará los pesos y guiará a OpenAI para generar la obra final.
             </p>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
