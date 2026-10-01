@@ -1,0 +1,29 @@
+# Normaliza los finales de linea para que Git no marque todo como modificado
+# al trabajar en Windows (CRLF) y subir desde Linux/macOS (LF).
+
+* text=auto eol=lf
+
+# Binarios: nunca tocar
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.svg text eol=lf
+*.woff binary
+*.woff2 binary
+*.mp3 binary
+*.mp4 binary
+*.webm binary
+*.pdf binary
+*.zip binary
+
+# Scripts de Windows: deben llevar CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Lockfiles: sin conflictos de merging
+pnpm-lock.yaml -diff
+package-lock.json -diff
