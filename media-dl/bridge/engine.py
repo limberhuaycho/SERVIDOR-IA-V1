@@ -482,16 +482,18 @@ def media_info(url: str) -> dict[str, Any]:
 
 def resolve_tiktok(url: str, quality: Any = "auto") -> dict[str, Any]:
     """
-    Resolve a TikTok link into video + music URLs **without the watermark**.
+    Resolve a TikTok link into a downloadable video **without the watermark**.
 
-    TikWM (the third-party API used before) now answers 403/empty bodies, so the
-    engine relies on yt-dlp instead, which reads TikTok's own ``play_addr``
-    endpoint. That endpoint serves the unwatermarked stream.
+    TikWM (the third-party API used before) answers 403/empty bodies, so the
+    engine relies on yt-dlp, which reads TikTok's own endpoints. That unwatermarked
+    stream is served from TikTok's CDN, and the CDN answers **403 to anything that
+    is not yt-dlp**: it validates the session cookies, so handing that URL to the
+    browser (or to /api/proxy) fails with 403 and the user sees nothing download.
 
-    Video and audio are separate streams on TikTok: the returned ``videoUrl`` is
-    the video-only track and ``musicUrl`` carries the sound. They are **not**
-    merged here, so the JSON advertises ``mode="direct"`` and no ``servePath``:
-    a client that needs a single file with sound has to mux the two itself.
+    Because of that the video is downloaded here, through yt-dlp, and served as a
+    local file. This has two side benefits: the download works on mobile (same
+    origin, no cross-origin `download` attribute) and yt-dlp merges the separate
+    video and audio tracks with ffmpeg, so the result carries sound.
     """
     height = _parse_height(quality)
 
@@ -512,26 +514,40 @@ def resolve_tiktok(url: str, quality: Any = "auto") -> dict[str, Any]:
     cover = probe.get("thumbnail")
     duration = probe.get("duration")
 
-    # The best single progressive stream: TikTok exposes the unwatermarked
-    # ``download_addr``/``play_addr`` variants, both without the TikTok logo.
-    video_url = _pick_direct_url(probe)
-    quality_label = f"{height}p" if height else "Original"
+    # The unwatermarked progressive stream; the unwatermarked variants are the
+    # ones yt-dlp exposes as download_addr/play_addr.
+    direct_url = _pick_direct_url(probe)
 
-    # yt-dlp exposes separate audio-only formats for TikTok; pick the best one so
-    # the front-end can offer the original track even without merging locally.
+    # The audio-only track, so the front-end can offer the original song even if
+    # the merged file is not requested.
     music_url = None
     for fmt in probe.get("formats") or []:
         if isinstance(fmt, dict) and fmt.get("acodec") != "none" and fmt.get("vcodec") == "none":
             music_url = fmt.get("url")
             break
 
+    # El nombre acaba en la URL, asi que no puede llevar espacios: se
+    # convierten en guiones bajos para que /downloads/... sea valida.
+    stem = "tiktok-" + _SAFE_NAME.sub("_", title)[:60].strip().replace(" ", "_")
+    try:
+        final = _download_to_disk(url, _height_selector(height), stem, {})
+    except BridgeError:
+        # No ffmpeg means no merge; a video-only file is still better than a 403.
+        final = None
+
+    # La pista de audio tambien vive en la CDN de TikTok, asi que su URL
+    # sufferiria el mismo 403. Se descarga aqui para que el boton de audio
+    # funcione en lugar de apuntar a un enlace muerto.
+    audio_path = None
+    try:
+        audio_path = _download_to_disk(url, "ba[ext=m4a]/ba/b", f"{stem}-audio", {})
+    except BridgeError:
+        audio_path = None
+
+    quality_label = f"{height}p" if height else "Original"
+
     result: dict[str, Any] = {
         "ok": True,
-        "mode": "direct",
-        "url": video_url,
-        "videoUrl": video_url,
-        "videoHdUrl": video_url,
-        "musicUrl": music_url,
         "title": title,
         "description": probe.get("description") or "",
         "author": uploader,
@@ -542,10 +558,25 @@ def resolve_tiktok(url: str, quality: Any = "auto") -> dict[str, Any]:
         "cover": cover,
         "watermark": False,
         "quality": quality_label,
+        "musicUrl": music_url,
         "engine": "media-dl + yt-dlp (sin marca de agua)",
     }
-    return result
 
+    if final:
+        result["mode"] = "file"
+        result["servePath"] = _public_path(final)
+        result["url"] = _public_path(final)
+        result["videoUrl"] = _public_path(final)
+        result["videoHdUrl"] = _public_path(final)
+        if audio_path:
+            result["musicUrl"] = _public_path(audio_path)
+    else:
+        result["mode"] = "direct"
+        result["url"] = direct_url
+        result["videoUrl"] = direct_url
+        result["videoHdUrl"] = direct_url
+
+    return result
 
 def _version() -> str:
     try:
