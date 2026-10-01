@@ -1,1 +1,30 @@
 node_modules
+
+# Dependencias del backend Express
+server/node_modules
+
+# Secretos: NUNCA subir. server/.env contiene la clave de OpenAI.
+.env
+server/.env
+*.local
+
+# Archivos descargados por el motor media-dl
+downloads/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+media-dl/src/*.egg-info/
+
+# Logs de arranque
+server/.server.log
+server/.server.err
+.pnpm.log
+.pnpm.err
+
+# Sistema
+.DS_Store
+Thumbs.db
+

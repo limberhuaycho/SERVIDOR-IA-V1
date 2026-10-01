@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+*.egg-info/
+*.egg
+
+# PyInstaller (los scripts de build/ SI se versionan)
+build/media-dl/
+build/media_dl/
+*.spec.bak
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Project specific
+downloads/
+*.db
+*.db-journal
+config.json
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp

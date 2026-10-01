@@ -2,7 +2,9 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const multer = require('multer');
+const path = require('path');
 const { CatNetwork } = require('./cat-network');
+const engine = require('./media-dl-client');
 
 dotenv.config();
 
@@ -12,6 +14,32 @@ const PORT = process.env.PORT || 4000;
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Carpeta donde el motor media-dl deja los archivos ya descargados.
+const DOWNLOADS_DIR = engine.DOWNLOADS_DIR;
+app.use(
+  '/downloads',
+  express.static(DOWNLOADS_DIR, {
+    // attachment force descarga en vez de abrirlo en el navegador.
+    setHeaders: (res) => res.setHeader('Content-Disposition', 'attachment'),
+  }),
+);
+
+/** Origen con el que el navegador puede pedir los archivos locales. */
+function publicOrigin(req) {
+  const configured = process.env.PUBLIC_ORIGIN;
+  if (configured) return configured.replace(/\/$/, '');
+  return `${req.protocol}://${req.get('host') || `localhost:${PORT}`}`;
+}
+
+/**
+ * Resuelve una URL contra el motor media-dl y devuelve la URL final.
+ * Lanza si el motor no puede, para que el endpoint caiga al fallback.
+ */
+async function resolveWithEngine(req, kind, payload) {
+  const result = await engine.runBridge(kind, payload);
+  return engine.toDownloadUrl(result, publicOrigin(req));
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -37,6 +65,17 @@ function getOpenAI() {
 // ----------------------------------------------------
 // 1. ESTADO DEL SERVIDOR Y RED
 // ----------------------------------------------------
+// Estado del motor de descargas, para diagnostico desde el navegador.
+let engineStatus = { ok: false, error: 'sin comprobar' };
+engine.getStatus().then((status) => {
+  engineStatus = status;
+  console.log(
+    status.ok
+      ? `--- Motor media-dl v${status.version} listo (ffmpeg: ${status.ffmpeg ? 'si' : 'no'}) ---`
+      : `--- Motor media-dl NO disponible: ${status.error} ---`,
+  );
+});
+
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -47,8 +86,20 @@ app.get('/api/health', (req, res) => {
       lastLoss: catNet.lastLoss,
       architecture: 'MLP 32 -> 24 (ReLU) -> 8 (Sigmoid) desde cero',
     },
+    mediaEngine: engineStatus,
     openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
   });
+});
+
+// Metadatos completos de un enlace (titulo, calidades, formatos, thumbnail).
+app.post('/api/media-info', async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: 'URL requerida' });
+  try {
+    res.json(await engine.getInfo(url.trim()));
+  } catch (err) {
+    res.status(422).json({ error: err.message });
+  }
 });
 
 // ----------------------------------------------------
@@ -103,6 +154,25 @@ app.post('/api/download-video', async (req, res) => {
   const { url, quality = '720' } = req.body;
   if (!url) return res.status(400).json({ error: 'URL requerida' });
 
+  // 1) Motor media-dl (yt-dlp): cubre +100 plataformas.
+  try {
+    const result = await engine.resolveVideo(url.trim(), quality);
+    return res.json({
+      success: true,
+      title: result.title,
+      downloadUrl: engine.toDownloadUrl(result, publicOrigin(req)),
+      quality: result.quality,
+      platform: result.platform,
+      uploader: result.uploader || undefined,
+      duration: result.duration || undefined,
+      thumbnail: result.thumbnail || undefined,
+      engine: result.engine,
+    });
+  } catch (engineErr) {
+    console.warn('[media-dl] video:', engineErr.message);
+  }
+
+  // 2) Fallback heredado: TikWM y Cobalt.
   try {
     // Intentar servicio universal Cobalt público o TikWM si es TikTok
     if (url.includes('tiktok.com')) {
@@ -190,6 +260,24 @@ app.post('/api/download-music', async (req, res) => {
   const { url, format = 'mp3' } = req.body;
   if (!url) return res.status(400).json({ error: 'URL requerida' });
 
+  // 1) Motor media-dl: extrae audio de +100 plataformas y convierte a MP3.
+  try {
+    const result = await engine.resolveAudio(url.trim(), format, req.body.bitrate || 192);
+    return res.json({
+      success: true,
+      title: result.title,
+      downloadUrl: engine.toDownloadUrl(result, publicOrigin(req)),
+      format: result.format,
+      platform: result.platform,
+      uploader: result.uploader || undefined,
+      thumbnail: result.thumbnail || undefined,
+      engine: result.engine,
+    });
+  } catch (engineErr) {
+    console.warn('[media-dl] audio:', engineErr.message);
+  }
+
+  // 2) Fallback heredado: TikWM y Cobalt.
   try {
     if (url.includes('tiktok.com')) {
       const tikRes = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`);
