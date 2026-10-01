@@ -50,19 +50,75 @@ BASE_OPTS: dict[str, Any] = {
 
 _SAFE_NAME = re.compile(r"[^\w\-. ]+", re.UNICODE)
 
+#: Cache de la busqueda de ffmpeg (se rellena en ``find_ffmpeg``).
+_FFMPEG_PATH: str | None = None
+_FFMPEG_CHECKED = False
+
 
 class BridgeError(RuntimeError):
     """Raised when a URL cannot be resolved into a downloadable resource."""
 
 
+def find_ffmpeg() -> str | None:
+    """
+    Localiza el ejecutable de ffmpeg y recuerda el resultado.
+
+    ``shutil.which`` solo mira el PATH. Cuando el servidor se lanza como
+    proceso en segundo plano (Scheduled Task, servicio, ``Start-Process``) el
+    PATH heredado no incluye la carpeta de WinGet, y ffmpeg aparece como
+    "no disponible" aunque este instalado. Sin ffmpeg no hay forma de fusionar
+    video+audio, que TikTok exige porque sus formatos de video no llevan pista
+    de sonido.
+    """
+    global _FFMPEG_PATH, _FFMPEG_CHECKED
+    if _FFMPEG_CHECKED:
+        return _FFMPEG_PATH
+    _FFMPEG_CHECKED = True
+
+    found = shutil.which("ffmpeg")
+    if not found:
+        candidates: list[Path] = []
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            # Paquetes de WinGet, en cualquier version.
+            winget = Path(local_appdata) / "Microsoft" / "WinGet" / "Packages"
+            if winget.is_dir():
+                candidates.extend(sorted(winget.glob("*/ffmpeg*/bin/ffmpeg.exe"), reverse=True))
+        candidates += [
+            Path("C:/ffmpeg/bin/ffmpeg.exe"),
+            Path("D:/ffmpeg/bin/ffmpeg.exe"),
+            Path("H:/ffmpeg/bin/ffmpeg.exe"),
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                found = str(candidate)
+                break
+
+    _FFMPEG_PATH = found
+    return found
+
+
 def has_ffmpeg() -> bool:
     """True when ffmpeg is reachable, required for merging/conversion."""
-    return shutil.which("ffmpeg") is not None
+    return find_ffmpeg() is not None
 
 
 def has_aria2c() -> bool:
     """True when aria2c is reachable, enables the faster download strategy."""
     return shutil.which("aria2c") is not None
+
+
+def base_opts() -> dict[str, Any]:
+    """
+    Opciones comunes de yt-dlp.
+
+    ``ffmpeg_location`` se inyecta aqui para que la fusion de video+audio y la
+    conversion a MP3 funcionen aunque ffmpeg no este en el PATH del proceso.
+    """
+    return {
+        **BASE_OPTS,
+        "ffmpeg_location": find_ffmpeg(),
+    }
 
 
 def _run_async(coro: Any) -> Any:
@@ -96,8 +152,11 @@ def _height_selector(height: int | None) -> str:
 def _merged_selector(height: int | None) -> str:
     """Highest-quality selector; may need ffmpeg to merge video+audio."""
     if not height:
-        return "bestvideo+bestaudio/best"
-    return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
+        # Sin altura: se toma el mejor video y el mejor audio por separado y se
+        # fusionan con ffmpeg. Es la unica forma de obtener la maxima calidad
+        # real en TikTok, donde los formatos de video nunca traen audio.
+        return "bestvideo*+bestaudio/best"
+    return f"bestvideo*[height<={height}]+bestaudio/best[height<={height}]/best"
 
 
 def _parse_height(quality: Any) -> int | None:
@@ -126,7 +185,7 @@ def _download_to_disk(url: str, selector: str, stem: str, extra_opts: dict[str, 
     target = DOWNLOAD_ROOT / f"{stem}.%(ext)s"
 
     opts: dict[str, Any] = {
-        **BASE_OPTS,
+        **base_opts(),
         "format": selector,
         "outtmpl": str(target),
         "noplaylist": True,
@@ -198,7 +257,7 @@ def resolve_video(url: str, quality: Any = "720") -> dict[str, Any]:
     # Fast path: a direct link avoids pushing bytes through the local server.
     try:
         with yt_dlp.YoutubeDL(
-            {**BASE_OPTS, "format": _height_selector(height), "skip_download": True}
+            {**base_opts(), "format": _height_selector(height), "skip_download": True}
         ) as ydl:  # type: ignore[no-untyped-call]
             probe = ydl.extract_info(url, download=False)
         direct = _pick_direct_url(probe)
@@ -341,7 +400,7 @@ def _probe_audio(url: str) -> dict[str, Any] | None:
     """Inspect the best audio stream without downloading it."""
     try:
         with yt_dlp.YoutubeDL(
-            {**BASE_OPTS, "format": "bestaudio/best", "skip_download": True}
+            {**base_opts(), "format": "bestaudio/best", "skip_download": True}
         ) as ydl:  # type: ignore[no-untyped-call]
             return ydl.extract_info(url, download=False)
     except Exception:
@@ -360,7 +419,10 @@ def _audio_payload(
 ) -> dict[str, Any]:
     return {
         "ok": True,
-        "mode": mode,
+        # Estos payloads apuntan a una URL directa del CDN: no hay archivo en
+        # disco, asi que el modo debe ser "direct" (antes faltaba y lanzaba
+        # NameError, tumbando todo el endpoint de audio).
+        "mode": "direct",
         "url": url,
         "title": title,
         "platform": platform,
@@ -418,6 +480,73 @@ def media_info(url: str) -> dict[str, Any]:
     }
 
 
+def resolve_tiktok(url: str, quality: Any = "auto") -> dict[str, Any]:
+    """
+    Resolve a TikTok link into video + music URLs **without the watermark**.
+
+    TikWM (the third-party API used before) now answers 403/empty bodies, so the
+    engine relies on yt-dlp instead, which reads TikTok's own ``play_addr``
+    endpoint. That endpoint serves the unwatermarked stream.
+
+    Video and audio are separate streams on TikTok: the returned ``videoUrl`` is
+    the video-only track and ``musicUrl`` carries the sound. They are **not**
+    merged here, so the JSON advertises ``mode="direct"`` and no ``servePath``:
+    a client that needs a single file with sound has to mux the two itself.
+    """
+    height = _parse_height(quality)
+
+    probe: dict[str, Any] | None = None
+    try:
+        with yt_dlp.YoutubeDL(
+            {**base_opts(), "format": _height_selector(height), "skip_download": True}
+        ) as ydl:  # type: ignore[no-untyped-call]
+            probe = ydl.extract_info(url, download=False)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise BridgeError(f"TikTok no pudo resolverse: {exc}") from exc
+
+    if not isinstance(probe, dict):
+        raise BridgeError("TikTok no devolvio informacion utilizable.")
+
+    title = probe.get("title") or probe.get("description") or "Video de TikTok"
+    uploader = probe.get("uploader") or probe.get("creator") or probe.get("channel")
+    cover = probe.get("thumbnail")
+    duration = probe.get("duration")
+
+    # The best single progressive stream: TikTok exposes the unwatermarked
+    # ``download_addr``/``play_addr`` variants, both without the TikTok logo.
+    video_url = _pick_direct_url(probe)
+    quality_label = f"{height}p" if height else "Original"
+
+    # yt-dlp exposes separate audio-only formats for TikTok; pick the best one so
+    # the front-end can offer the original track even without merging locally.
+    music_url = None
+    for fmt in probe.get("formats") or []:
+        if isinstance(fmt, dict) and fmt.get("acodec") != "none" and fmt.get("vcodec") == "none":
+            music_url = fmt.get("url")
+            break
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "mode": "direct",
+        "url": video_url,
+        "videoUrl": video_url,
+        "videoHdUrl": video_url,
+        "musicUrl": music_url,
+        "title": title,
+        "description": probe.get("description") or "",
+        "author": uploader,
+        "uploader": uploader,
+        "platform": "TikTok",
+        "duration": duration,
+        "thumbnail": cover,
+        "cover": cover,
+        "watermark": False,
+        "quality": quality_label,
+        "engine": "media-dl + yt-dlp (sin marca de agua)",
+    }
+    return result
+
+
 def _version() -> str:
     try:
         from media_dl import __version__
@@ -430,12 +559,14 @@ def _version() -> str:
 def health() -> dict[str, Any]:
     """Report engine readiness so the Node server can surface it."""
     DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    ffmpeg = find_ffmpeg()
     return {
         "ok": True,
         "engine": "media-dl",
         "version": _version(),
         "python": sys.version.split()[0],
-        "ffmpeg": has_ffmpeg(),
+        "ffmpeg": ffmpeg is not None,
+        "ffmpegPath": ffmpeg,
         "aria2c": has_aria2c(),
         "downloadsDir": str(DOWNLOAD_ROOT),
     }

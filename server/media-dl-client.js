@@ -176,6 +176,17 @@ function resolveAudio(url, format, bitrate) {
   return runBridge('audio', { url, format, bitrate }, 600000);
 }
 
+/**
+ * TikTok sin marca de agua via yt-dlp.
+ *
+ * Antes este flujo dependia por completo de la API de TikWM, que hoy responde
+ * 403 con cuerpo vacio. yt-dlp lee el endpoint propio de TikTok, asi que no
+ * depende de ningun intermediario.
+ */
+function resolveTiktok(url, quality = 'auto') {
+  return runBridge('tiktok', { url, quality }, 180000);
+}
+
 function getInfo(url) {
   return runBridge('info', { url }, 120000);
 }
@@ -194,6 +205,7 @@ module.exports = {
   getStatus,
   resolveVideo,
   resolveAudio,
+  resolveTiktok,
   getInfo,
   toDownloadUrl,
   runBridge,

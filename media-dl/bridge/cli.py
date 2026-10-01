@@ -57,6 +57,11 @@ def _main(argv: list[str]) -> int:
                 payload.get("format", "mp3"),
                 payload.get("bitrate", 192),
             )
+        elif command == "tiktok":
+            result = engine.resolve_tiktok(
+                payload["url"],
+                payload.get("quality", "auto"),
+            )
         else:
             print(json.dumps({"ok": False, "error": f"Comando desconocido: {command}"}))
             return 2

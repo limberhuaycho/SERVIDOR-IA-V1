@@ -154,7 +154,7 @@ function AppShell({ children }: { children: ReactNode }) {
     <div className="app-shell">
       <aside className={`sidebar ${menuOpen ? 'open' : ''}`}>
         <Link href="/" className="brand" data-testid="link-brand" onClick={() => setMenuOpen(false)}>
-          <span className="brand-mark">L</span>
+          <img className="brand-mark" src="/lc-logo.png" alt="LC Systems" width={34} height={34} />
           <span><span className="brand-name">LC Systems</span><span className="brand-sub">media intelligence</span></span>
         </Link>
         <nav aria-label="Navegación principal">
@@ -315,11 +315,46 @@ function getApiUrl() {
   return localStorage.getItem('lc-api-url') || 'http://localhost:4000';
 }
 
+/**
+ * Descarga un archivo pasandolo por el proxy del servidor.
+ *
+ * En movil el atributo `download` se ignora para URLs de otro origen: el video
+ * se abre en el reproductor en lugar de guardarse. El proxy devuelve la misma
+ * peticion como same-origin y con `Content-Disposition: attachment`, que si
+ * respetan iOS Safari y Android Chrome.
+ */
+async function downloadViaProxy(url: string, filename: string, kind: 'video' | 'audio' | 'image') {
+  if (!url) return;
+  const apiUrl = getApiUrl();
+  const target = url.startsWith(apiUrl)
+    ? url
+    : `${apiUrl}/api/proxy?${new URLSearchParams({ url, kind, filename })}`;
+
+  // En escritorio un enlace directo basta y es mas rapido; en movil se fuerza
+  // la navegacion al proxy para que la descarga se dispare de verdad.
+  if (!isMobile()) {
+    const anchor = document.createElement('a');
+    anchor.href = target;
+    anchor.rel = 'noopener';
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    return;
+  }
+  window.location.href = target;
+}
+
+function isMobile() {
+  if (typeof navigator === 'undefined') return false;
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
+
 function VideoDownloadView() {
   const [url, setUrl] = useState('');
-  const [quality, setQuality] = useState('720');
+  const [quality, setQuality] = useState('auto');
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<{ title: string; downloadUrl: string; quality?: string } | null>(null);
+  const [result, setResult] = useState<{ title: string; downloadUrl: string; directUrl?: string; quality?: string; engine?: string } | null>(null);
   const { toasts, notify, remove } = useToasts();
 
   const handleDownload = async () => {
@@ -343,20 +378,9 @@ function VideoDownloadView() {
       setResult(data);
       notify('Enlace de video listo para descargar.', 'ok');
     } catch (err: any) {
-      // Fallback amigable directo si el servidor local no está encendido
+      // TikWM ya no se usa como fallback: responde 403 y ademas el navegador
+      // lo bloquea por CORS, asi que ese camino nunca funciono.
       notify(err.message || 'Servidor no detectado. Revisa tu backend en http://localhost:4000', 'error');
-      // Proporcionar fallback directo seguro
-      if (url.includes('tiktok.com')) {
-        try {
-          const tikRes = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url.trim())}`);
-          const tikData = await tikRes.json();
-          if (tikData.data?.play) {
-            setResult({ title: tikData.data.title || 'Video TikTok', downloadUrl: tikData.data.play, quality: 'HD' });
-            notify('Video obtenido mediante fallback directo.', 'ok');
-            return;
-          }
-        } catch (_) {}
-      }
     } finally {
       setLoading(false);
     }
@@ -378,9 +402,12 @@ function VideoDownloadView() {
               onChange={(e) => setUrl(e.target.value)}
               placeholder="https://www.youtube.com/watch?v=... o enlace de TikTok/Instagram"
             />
-            <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
               <label className="input-label" style={{ margin: 0 }}>Calidad:</label>
-              <select className="select" style={{ maxWidth: 160 }} value={quality} onChange={(e) => setQuality(e.target.value)}>
+              <select className="select" style={{ maxWidth: 180 }} value={quality} onChange={(e) => setQuality(e.target.value)}>
+                <option value="auto">Automática (mejor)</option>
+                <option value="2160">2160p (4K)</option>
+                <option value="1440">1440p (QHD)</option>
                 <option value="1080">1080p (FHD)</option>
                 <option value="720">720p (HD)</option>
                 <option value="480">480p (SD)</option>
@@ -395,11 +422,19 @@ function VideoDownloadView() {
           {result && (
             <div className="process-box" style={{ marginTop: 20 }}>
               <div style={{ fontWeight: 600, marginBottom: 8 }}>✅ Video listo: {result.title}</div>
+              {result.quality && (
+                <div style={{ fontSize: 13, color: 'hsl(var(--muted-foreground))', marginBottom: 10 }}>
+                  Calidad: {result.quality}{result.engine ? ` · ${result.engine}` : ''}
+                </div>
+              )}
               <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                <a href={result.downloadUrl} target="_blank" rel="noopener noreferrer" className="btn btn-primary" download>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => downloadViaProxy(result.downloadUrl, 'video.mp4', 'video')}
+                >
                   <Download size={14} /> Descargar archivo
-                </a>
-                <button className="btn btn-secondary" onClick={() => { navigator.clipboard?.writeText(result.downloadUrl); notify('Enlace copiado', 'ok'); }}>
+                </button>
+                <button className="btn btn-secondary" onClick={() => { navigator.clipboard?.writeText(result.directUrl || result.downloadUrl); notify('Enlace copiado', 'ok'); }}>
                   <Copy size={14} /> Copiar enlace directo
                 </button>
               </div>
@@ -428,7 +463,7 @@ function MusicDownloadView() {
   const [url, setUrl] = useState('');
   const [format, setFormat] = useState('mp3');
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<{ title: string; downloadUrl: string; format?: string } | null>(null);
+  const [result, setResult] = useState<{ title: string; downloadUrl: string; directUrl?: string; format?: string; engine?: string } | null>(null);
   const { toasts, notify, remove } = useToasts();
 
   const handleDownload = async () => {
@@ -452,17 +487,8 @@ function MusicDownloadView() {
       setResult(data);
       notify('Pista de audio lista para descargar.', 'ok');
     } catch (err: any) {
+      // Sin fallback a TikWM: devuelve 403 y el navegador lo bloquea por CORS.
       notify(err.message || 'Servidor no detectado. Revisa tu backend en http://localhost:4000', 'error');
-      if (url.includes('tiktok.com')) {
-        try {
-          const tikRes = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url.trim())}`);
-          const tikData = await tikRes.json();
-          if (tikData.data?.music) {
-            setResult({ title: tikData.data.music_info?.title || 'Audio TikTok', downloadUrl: tikData.data.music, format: 'mp3' });
-            notify('Audio obtenido mediante fallback.', 'ok');
-          }
-        } catch (_) {}
-      }
     } finally {
       setLoading(false);
     }
@@ -500,11 +526,19 @@ function MusicDownloadView() {
           {result && (
             <div className="process-box" style={{ marginTop: 20 }}>
               <div style={{ fontWeight: 600, marginBottom: 8 }}>🎵 Audio listo: {result.title}</div>
+              {result.format && (
+                <div style={{ fontSize: 13, color: 'hsl(var(--muted-foreground))', marginBottom: 10 }}>
+                  Formato: {result.format.toUpperCase()}{result.engine ? ` · ${result.engine}` : ''}
+                </div>
+              )}
               <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                <a href={result.downloadUrl} target="_blank" rel="noopener noreferrer" className="btn btn-primary" download>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => downloadViaProxy(result.downloadUrl, `audio.${result.format || 'mp3'}`, 'audio')}
+                >
                   <Download size={14} /> Descargar archivo de audio
-                </a>
-                <button className="btn btn-secondary" onClick={() => { navigator.clipboard?.writeText(result.downloadUrl); notify('Enlace copiado', 'ok'); }}>
+                </button>
+                <button className="btn btn-secondary" onClick={() => { navigator.clipboard?.writeText(result.directUrl || result.downloadUrl); notify('Enlace copiado', 'ok'); }}>
                   <Copy size={14} /> Copiar enlace
                 </button>
               </div>
@@ -552,25 +586,9 @@ function TikTokDownloadView() {
       setData(json);
       notify('Video de TikTok obtenido sin marca de agua.', 'ok');
     } catch (err: any) {
-      // Fallback directo desde navegador al API de tikwm
-      try {
-        const fallbackRes = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url.trim())}`);
-        const fallbackJson = await fallbackRes.json();
-        if (fallbackJson.code === 0 && fallbackJson.data) {
-          const item = fallbackJson.data;
-          setData({
-            title: item.title || 'Video de TikTok',
-            author: { name: item.author?.nickname || 'Creador', avatar: item.author?.avatar },
-            cover: item.cover,
-            videoUrl: item.play,
-            videoHdUrl: item.hdplay || item.play,
-            musicUrl: item.music,
-            musicTitle: item.music_info?.title || 'Audio original',
-          });
-          notify('Video de TikTok cargado correctamente.', 'ok');
-          return;
-        }
-      } catch (_) {}
+      // Antes se recurria a TikWM desde el navegador: responde 403 y ademas
+      // CORS lo bloquea, asi que el fallback nunca llego a funcionar. Ahora el
+      // error real del motor se muestra tal cual.
       notify(err.message || 'No se pudo obtener el video de TikTok.', 'error');
     } finally {
       setLoading(false);
@@ -617,15 +635,32 @@ function TikTokDownloadView() {
               )}
 
               <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                <a href={data.videoHdUrl || data.videoUrl} target="_blank" rel="noopener noreferrer" className="btn btn-primary" download>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => downloadViaProxy(data.videoHdUrl || data.videoUrl, 'tiktok.mp4', 'video')}
+                >
                   <Download size={14} /> Video Sin Marca de Agua (HD)
-                </a>
+                </button>
                 {data.musicUrl && (
-                  <a href={data.musicUrl} target="_blank" rel="noopener noreferrer" className="btn btn-secondary" download>
+                  <button
+                    className="btn btn-secondary"
+                    onClick={() => downloadViaProxy(data.musicUrl, 'tiktok-audio.mp3', 'audio')}
+                  >
                     <Music2 size={14} /> Descargar Audio MP3
-                  </a>
+                  </button>
                 )}
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => { navigator.clipboard?.writeText(data.rawVideoUrl || data.videoUrl); notify('Enlace copiado', 'ok'); }}
+                >
+                  <Copy size={14} /> Copiar enlace directo
+                </button>
               </div>
+              {data.engine && (
+                <p style={{ margin: '12px 0 0', fontSize: 12, color: 'hsl(var(--muted-foreground))' }}>
+                  Motor: {data.engine}
+                </p>
+              )}
             </div>
           )}
         </section>
@@ -690,10 +725,10 @@ function ImageAIGeneratorView() {
         throw new Error(data.error || 'Error al generar imagen');
       }
     } catch (err: any) {
-      // Fallback directo a Pollinations AI
-      const fallbackUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt.trim())}?width=1024&height=1024&nologo=true`;
-      setGenImage(fallbackUrl);
-      notify('Imagen generada con generador alternativo.', 'ok');
+      // El backend ya tiene su propio respaldo (Pollinations), asi que si
+      // falla aqui el problema es de conexion: se informa el error real en vez
+      // de inventar una imagen.
+      notify(err.message || 'No se pudo contactar con el servidor de imágenes.', 'error');
     } finally {
       setLoading(false);
     }
@@ -726,23 +761,14 @@ function ImageAIGeneratorView() {
       setNeuralResult(data);
       notify('Gato procesado con la Red Neuronal y generado con IA.', 'ok');
     } catch (err: any) {
-      // Simulación de la red neuronal en cliente en caso de no tener backend encendido
-      const simPrompt = `Retrato cinematográfico fotorrealista del gato "${catName}". Características: ${catDesc}. Estilo enriquecido por red neuronal: alto nivel de detalle en pelaje, iluminación de estudio suave, ojos brillantes vivos 8k.`;
-      const fallbackUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(simPrompt)}?width=1024&height=1024&model=flux&seed=${Math.floor(Math.random() * 99999)}`;
-      setNeuralResult({
-        catName,
-        description: catDesc,
-        neuralAnalysis: {
-          networkLoss: 0.0421,
-          detectedStyles: ['alto nivel de detalle en pelaje', 'tonos cálidos dorados', 'iluminación cinematográfica'],
-          activationVector: [0.89, 0.74, 0.95, 0.31, 0.88, 0.22, 0.65, 0.78],
-          architecture: 'MLP 32-24-8 entrenado desde cero con Backpropagation',
-        },
-        enrichedPrompt: simPrompt,
-        generatedImageUrl: fallbackUrl,
-        provider: 'Red Neuronal Felina (Cliente + Flux AI)',
-      });
-      notify('Procesado con la Red Neuronal y generado.', 'ok');
+      // Sin el backend no hay red neuronal que ejecutar. Antes se mostraba una
+      // simulacion con perdida y vector de activacion inventados, lo que hacia
+      // pasar por datos reales algo que no se calculo nunca.
+      notify(
+        err.message
+          || 'La red neuronal se ejecuta en el servidor local. Enciende el backend en http://localhost:4000 para usarla.',
+        'error',
+      );
     } finally {
       setLoading(false);
     }

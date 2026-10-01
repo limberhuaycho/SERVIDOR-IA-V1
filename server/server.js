@@ -102,48 +102,257 @@ app.post('/api/media-info', async (req, res) => {
   }
 });
 
+/**
+ * Envuelve una URL externa en el proxy de descarga local.
+ *
+ * En iOS Safari y Android Chrome el atributo `download` se ignora cuando la
+ * URL es de otro origen: el archivo se abre en el reproductor en vez de
+ * guardarse. Al pasar por este servidor la descarga es same-origin y llega con
+ * `Content-Disposition: attachment`, que ambos navegadores respetan.
+ */
+function proxied(req, url, kind = 'video', filename) {
+  if (!url) return url;
+  if (url.startsWith('/downloads/')) return `${publicOrigin(req)}${url}`;
+  const params = new URLSearchParams({ url, kind });
+  if (filename) params.set('filename', filename);
+  return `${publicOrigin(req)}/api/proxy?${params.toString()}`;
+}
+
 // ----------------------------------------------------
 // 2. DESCARGADOR DE TIKTOK (Sin marca de agua)
 // ----------------------------------------------------
 app.post('/api/tiktok', async (req, res) => {
-  const { url } = req.body;
-  if (!url || !url.includes('tiktok.com')) {
+  const { url, quality = 'auto' } = req.body;
+  if (!url || !/tiktok\.com/i.test(url)) {
     return res.status(400).json({ error: 'Proporciona una URL válida de TikTok' });
   }
 
+  // 1) Motor media-dl (yt-dlp): lee el endpoint propio de TikTok, sin marca de
+  //    agua y sin depender de terceros. Antes este endpoint solo consultaba
+  //    TikWM, que hoy responde 403 con cuerpo vacío.
   try {
-    // Usar la API de tikwm
+    const result = await engine.resolveTiktok(url.trim(), quality);
+    return res.json({
+      success: true,
+      title: result.title,
+      description: result.description || undefined,
+      author: {
+        name: result.author || 'Creador',
+        avatar: undefined,
+      },
+      creator: result.author || undefined,
+      cover: result.cover,
+      thumbnail: result.thumbnail || undefined,
+      duration: result.duration || undefined,
+      // El proxy mantiene la descarga funcionando en móvil: una URL
+      // cross-origin con el atributo `download` la ignora iOS y Android.
+      videoUrl: proxied(req, result.videoUrl, 'video'),
+      videoHdUrl: proxied(req, result.videoHdUrl || result.videoUrl, 'video'),
+      rawVideoUrl: result.videoUrl,
+      musicUrl: result.musicUrl ? proxied(req, result.musicUrl, 'audio') : undefined,
+      rawMusicUrl: result.musicUrl || undefined,
+      musicTitle: 'Audio original de TikTok',
+      quality: result.quality,
+      watermark: false,
+      engine: result.engine,
+    });
+  } catch (engineErr) {
+    console.warn('[media-dl] tiktok:', engineErr.message);
+  }
+
+  // 2) TikWM solo como red de seguridad (actualmente bloquea con 403).
+  try {
     const response = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`);
     const data = await response.json();
 
-    if (data.code !== 0 || !data.data) {
-      return res.status(400).json({ error: data.msg || 'No se pudo obtener el video de TikTok' });
+    if (data.code === 0 && data.data) {
+      const item = data.data;
+      return res.json({
+        success: true,
+        title: item.title || 'Video de TikTok',
+        author: { name: item.author?.nickname || 'Creador' },
+        cover: item.cover,
+        duration: item.duration,
+        videoUrl: proxied(req, item.play, 'video'),
+        videoHdUrl: proxied(req, item.hdplay || item.play, 'video'),
+        rawVideoUrl: item.play,
+        musicUrl: item.music ? proxied(req, item.music, 'audio') : undefined,
+        rawMusicUrl: item.music || undefined,
+        musicTitle: item.music_info?.title || 'Audio original',
+        quality: 'Original',
+        watermark: false,
+        engine: 'TikWM (respaldo)',
+      });
+    }
+  } catch (err) {
+    console.warn('[tikwm] respaldo:', err.message);
+  }
+
+  res.status(422).json({
+    error: 'No se pudo obtener el video. TikTok puede estar bloqueando la IP del servidor; prueba con otro enlace.',
+  });
+});
+
+// ----------------------------------------------------
+// 2b. PROXY DE DESCARGA (soluciona la descarga en movil)
+// ----------------------------------------------------
+
+const dns = require('dns').promises;
+const net = require('net');
+
+const PROXY_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  Accept: '*/*',
+};
+
+/**
+ * Indica si una IP es de uso publico.
+ *
+ * El proxy acepta URLs del usuario, asi que sin este filtro se podria usar para
+ * leer servicios locales (el propio servidor, la red domestica) o metadatos de
+ * la nube en 169.254.169.254.
+ */
+function isPublicIp(ip) {
+  const v = net.isIP(ip);
+  if (v === 4) {
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 0 || a === 10 || a === 127) return false;
+    if (a === 169 && b === 254) return false; // link-local,incluye metadatos
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT
+    if (a >= 224) return false; // multicast y reservadas
+    return true;
+  }
+  if (v === 6) {
+    const low = ip.toLowerCase();
+    if (low === '::1' || low === '::') return false;
+    if (low.startsWith('fe80')) return false; // link-local
+    if (low.startsWith('fc') || low.startsWith('fd')) return false; // unicast local
+    // IPv4 mapeada (::ffff:127.0.0.1) debe validarse con las reglas de v4.
+    const mapped = low.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return isPublicIp(mapped[1]);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Valida el destino del proxy y devuelve su URL normalizada.
+ * Rechaza destinos que no sean http(s) publicos.
+ */
+async function assertPublicTarget(target) {
+  let parsed;
+  try {
+    parsed = new URL(target);
+  } catch {
+    throw new Error('URL de origen no válida.');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Solo se admiten destinos http o https.');
+  }
+  const host = parsed.hostname.replace(/^\[|\]$/g, '');
+  // Un literal de IP se comprueba al momento; un nombre, tras resolver.
+  const addresses = net.isIP(host)
+    ? [{ address: host }]
+    : await dns.lookup(host, { all: true }).catch(() => []);
+  if (!addresses.length) throw new Error('No se pudo resolver el destino.');
+  if (!addresses.every((entry) => isPublicIp(entry.address))) {
+    throw new Error('Destino no permitido: apunta a una red interna.');
+  }
+  return parsed;
+}
+
+const EXT_BY_KIND = {
+  video: 'mp4',
+  audio: 'mp3',
+  image: 'jpg',
+};
+
+/** Nombre de archivo seguro para el header Content-Disposition. */
+function safeFilename(name, fallback) {
+  const cleaned = String(name || '')
+    .replace(/[^\w.\- ]+/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 100);
+  return cleaned || fallback;
+}
+
+/**
+ * Descarga el recurso a traves del servidor y lo sirve como adjunto.
+ *
+ * El problema que resuelve: en el telefono el enlace directo al CDN de TikTok o
+ * de YouTube se abre en el reproductor en vez de descargarse, porque iOS y
+ * Android ignoran `download` en recursos cross-origin. Aqui la peticion es
+ * same-origin y lleva `Content-Disposition: attachment`.
+ */
+app.get('/api/proxy', async (req, res) => {
+  const target = String(req.query.url || '');
+  const kind = String(req.query.kind || 'video');
+
+  if (!/^https?:\/\//i.test(target)) {
+    return res.status(400).json({ error: 'URL de origen no válida.' });
+  }
+
+  // Evita que el proxy se use como rebote hacia este mismo servidor.
+  if (target.startsWith(`${publicOrigin(req)}/api/`)) {
+    return res.status(400).json({ error: 'Destino no permitido.' });
+  }
+
+  try {
+    await assertPublicTarget(target);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  // El Range del cliente debe viajar al origen: si no, este responderia 206
+  // con el Content-Length del archivo completo y el movil no podria buscar.
+  const range = req.headers.range;
+
+  try {
+    const upstream = await fetch(target, {
+      headers: range ? { ...PROXY_HEADERS, Range: range } : PROXY_HEADERS,
+      redirect: 'follow',
+    });
+
+    if (!upstream.ok || !upstream.body) {
+      return res.status(502).json({ error: `El origen respondió ${upstream.status}.` });
     }
 
-    const item = data.data;
-    res.json({
-      success: true,
-      title: item.title || 'Video de TikTok',
-      author: {
-        name: item.author?.nickname || 'Creador',
-        unique_id: item.author?.unique_id || 'tiktok',
-        avatar: item.author?.avatar,
-      },
-      cover: item.cover,
-      duration: item.duration,
-      videoUrl: item.play, // Video sin marca de agua
-      videoHdUrl: item.hdplay || item.play,
-      musicUrl: item.music,
-      musicTitle: item.music_info?.title || 'Audio original',
-      stats: {
-        plays: item.play_count,
-        likes: item.digg_count,
-        shares: item.share_count,
-      },
-    });
+    const partial = upstream.status === 206;
+    const type = upstream.headers.get('content-type') || '';
+    const defaultExt = type.includes('mpegurl') ? 'mp4' : EXT_BY_KIND[kind] || 'mp4';
+    let filename = safeFilename(req.query.filename, `descarga.${defaultExt}`);
+    if (!/\.[a-z0-9]{2,5}$/i.test(filename)) filename += `.${defaultExt}`;
+
+    res.status(partial ? 206 : 200);
+    res.setHeader('Content-Type', type || 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    );
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Range, Accept-Ranges');
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    const length = upstream.headers.get('content-length');
+    if (length) res.setHeader('Content-Length', length);
+
+    // El Content-Range solo es valido si el origen lo envio: inventarlo produce
+    // respuestas incoherentes que el reproductor interpreta como corrupta.
+    if (partial) {
+      const contentRange = upstream.headers.get('content-range');
+      if (contentRange) res.setHeader('Content-Range', contentRange);
+    }
+
+    const { Readable } = require('stream');
+    Readable.fromWeb(upstream.body).pipe(res);
   } catch (err) {
-    console.error('Error TikTok:', err);
-    res.status(500).json({ error: 'Error al conectar con el servicio de TikTok: ' + err.message });
+    console.warn('[proxy]', err.message);
+    if (!res.headersSent) res.status(502).json({ error: 'No se pudo transferir el archivo.' });
+    else res.end();
   }
 });
 
@@ -151,16 +360,25 @@ app.post('/api/tiktok', async (req, res) => {
 // 3. DESCARGADOR DE VIDEO UNIVERSAL (YouTube, Instagram, etc.)
 // ----------------------------------------------------
 app.post('/api/download-video', async (req, res) => {
-  const { url, quality = '720' } = req.body;
+  const { url, quality = 'auto' } = req.body;
   if (!url) return res.status(400).json({ error: 'URL requerida' });
 
   // 1) Motor media-dl (yt-dlp): cubre +100 plataformas.
   try {
     const result = await engine.resolveVideo(url.trim(), quality);
+    const direct = engine.toDownloadUrl(result, publicOrigin(req));
     return res.json({
       success: true,
       title: result.title,
-      downloadUrl: engine.toDownloadUrl(result, publicOrigin(req)),
+      // Las URLs remotas del CDN pasan por el proxy para que el boton
+      // Descargue tambien en iOS y Android; las locales ya son same-origin.
+      downloadUrl: proxied(
+        req,
+        direct,
+        'video',
+        `${safeFilename(result.title, 'video')}.mp4`,
+      ),
+      directUrl: direct,
       quality: result.quality,
       platform: result.platform,
       uploader: result.uploader || undefined,
@@ -182,7 +400,7 @@ app.post('/api/download-video', async (req, res) => {
         return res.json({
           success: true,
           title: data.data.title || 'Video descargado',
-          downloadUrl: data.data.play,
+          downloadUrl: proxied(req, data.data.play, 'video'),
           quality: 'Original sin marca',
           author: data.data.author?.nickname,
         });
@@ -263,10 +481,19 @@ app.post('/api/download-music', async (req, res) => {
   // 1) Motor media-dl: extrae audio de +100 plataformas y convierte a MP3.
   try {
     const result = await engine.resolveAudio(url.trim(), format, req.body.bitrate || 192);
+    const direct = engine.toDownloadUrl(result, publicOrigin(req));
     return res.json({
       success: true,
       title: result.title,
-      downloadUrl: engine.toDownloadUrl(result, publicOrigin(req)),
+      // iOS decide como abrir el archivo por la extension: sin `.mp3` lo abre
+      // como pagina y no hay descarga. El proxy la garantiza.
+      downloadUrl: proxied(
+        req,
+        direct,
+        'audio',
+        `${safeFilename(result.title, 'audio')}.${result.format || format}`,
+      ),
+      directUrl: direct,
       format: result.format,
       platform: result.platform,
       uploader: result.uploader || undefined,
@@ -380,11 +607,14 @@ app.post('/api/generate-image', async (req, res) => {
 
   // Generador inteligente con Pollinations AI / SVG artístico
   const cleanPrompt = encodeURIComponent(prompt.trim());
-  const fallbackUrl = `https://image.pollinations.ai/prompt/${cleanPrompt}?width=1024&height=1024&nologo=true&enhance=true`;
+  const dims = String(size).match(/^\d{2,4}x\d{2,4}$/) ? size : '1024x1024';
+  const [w, h] = dims.split('x');
+  const fallbackUrl = `https://image.pollinations.ai/prompt/${cleanPrompt}?width=${w}&height=${h}&nologo=true&enhance=true&seed=${Date.now() % 100000}`;
 
   res.json({
     success: true,
-    imageUrl: fallbackUrl,
+    // Proxy para que la imagen se pueda guardar igual en movil.
+    imageUrl: proxied(req, fallbackUrl, 'image', `${safeFilename(prompt, 'imagen')}.jpg`),
     revisedPrompt: prompt,
     provider: openai ? 'Fallback neuronal' : 'Generador IA de alto rendimiento (Sin clave requerida)',
   });

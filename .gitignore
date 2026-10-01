@@ -28,3 +28,11 @@ server/.server.err
 .DS_Store
 Thumbs.db
 
+# Configuracion local de esta maquina: la unidad de trabajo no admite symlinks,
+# por eso se usa node-linker=hoisted. No debe viaja al repositorio.
+.npmrc
+
+# Archivos de trabajo del logo (4.8 MB). El sitio usa public/lc-logo.png,
+# que ya es el recorte definitivo; los originales no se publican.
+imagen/
+
